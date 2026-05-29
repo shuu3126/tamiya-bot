@@ -1,4 +1,7 @@
 import os
+import json
+import re
+from datetime import datetime
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -16,9 +19,56 @@ from linebot.v3.webhooks import (
     FollowEvent
 )
 import anthropic
+import gspread
+from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 load_dotenv()
+
+SPREADSHEET_ID = '12-QXsEG7m0SqLi7ZXJ67b5yl84-SbMdFE1pt9GCYueo'
+
+def get_sheet():
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    if not creds_json:
+        return None
+    creds_dict = json.loads(creds_json)
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    )
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SPREADSHEET_ID).get_worksheet(0)
+
+def save_lead(reply_text, history):
+    try:
+        ws = get_sheet()
+        if not ws:
+            return
+        name = company = role = industry = headcount = issue = numbers = proposal = ''
+        for line in reply_text.split('\n'):
+            if '氏名：' in line:
+                name = line.split('氏名：')[-1].split('　')[0].replace('様', '').strip()
+            elif '会社名：' in line:
+                company = line.split('会社名：')[-1].split('　')[0].strip()
+            elif '役職：' in line:
+                role = line.split('役職：')[-1].strip()
+        for msg in history:
+            if msg['role'] == 'user':
+                text = msg['content']
+                if any(k in text for k in ['業', '会社', '仕事']):
+                    industry = text[:30]
+        numbers_match = re.findall(r'週\S+時間|年間\S+時間|\d+時間', reply_text)
+        numbers = ' / '.join(numbers_match[:3])
+        issue_start = reply_text.find('現状と課題')
+        proposal_start = reply_text.find('オーダーメイドシステム')
+        if issue_start != -1:
+            issue = reply_text[issue_start:issue_start+100].replace('\n', ' ').strip()
+        if proposal_start != -1:
+            proposal = reply_text[proposal_start:proposal_start+80].replace('\n', ' ').strip()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        ws.append_row([now, name, company, role, industry, headcount, issue, numbers, proposal, '未対応'])
+    except Exception as e:
+        print(f'スプレッドシート書き込みエラー: {e}')
 
 app = Flask(__name__)
 
@@ -29,43 +79,42 @@ claude = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
 # ユーザーごとの会話履歴（メモリ）
 conversations = {}
 
-SYSTEM_PROMPT = """あなたはIT・業務改善の専門家として、企業の業務課題をヒアリングし、最適なICTソリューションを提案するコンサルタントです。
+SYSTEM_PROMPT = """あなたは中小企業の業務改善・システム開発を専門とするITコンサルタントです。
+丁寧なビジネス敬語で話しながら、相手の業務の痛みを具体的な数字で引き出し、最終的に「30分の無料相談」のアポを獲得することがゴールです。
 
-【基本姿勢】
-- 丁寧なビジネス敬語を使用する
-- 押し売りはしない。相手が自然と「こういうシステムが欲しい」と感じるよう会話を導く
-- 共感を示しながら課題を深掘りし、具体的な解決策をイメージさせる
+【会話の流れ（全5ターン厳守）】
 
-【ヒアリングの進め方】
-効率よく情報を集めるため、関連する質問は1〜2つまとめて聞く。全体で4〜5往復を目安にする。
+▼ターン1：プロフィール確認
+お名前・会社名・業種・役職・社員数をまとめて確認する。
 
-ターン1：プロフィール確認
-→ お名前・会社名・業種・役職をまとめて確認
+▼ターン2：現状把握
+以下を1つのメッセージでまとめて聞く。
+「現在、業務管理にはどんなツールをお使いですか？（エクセル・紙・専用ソフトなど）また、社内でデジタル化が進んでいない部分はどのあたりでしょうか？」
 
-ターン2：業務状況の把握
-→ 社員数・現在使用しているITツール・管理方法をまとめて確認
+▼ターン3：シナリオ提示で課題を引き出す
+「困っていることは？」と直接聞かず、業種に合わせて以下から2〜3個を選んで提示する。
 
-ターン3：シナリオ提示で課題を引き出す
-「困っていることは？」と直接聞かない。以下のようなシナリオを2〜3個提示して「当てはまるものはありますか？」と聞く。
+・顧客情報をエクセルや紙で管理していて、探すのに時間がかかる
+・見積書・請求書の作成が手作業で、ミスや確認作業が多い
+・勤怠管理がアナログで、月末の集計が大変
+・問い合わせ対応に追われて、本来の業務が進まない
+・在庫・発注管理がバラバラで、欠品やロスが起きやすい
+・スタッフへの連絡や情報共有が口頭・LINEで、抜け漏れがある
+・ホームページがなく、新規顧客に見つけてもらえない
 
-業種・規模に合わせて以下から選んで提示する：
-・「お客様の情報をエクセルや紙で管理していて、探すのに時間がかかる」
-・「見積書・請求書の作成が手作業で、ミスや手間がかかっている」
-・「社員の勤怠管理がアナログで、集計が大変」
-・「お客様からの問い合わせ対応に追われて、本来の業務が進まない」
-・「在庫や発注の管理がバラバラで、気づいたら在庫切れになっていた」
-・「スタッフへの連絡がLINEや口頭で、情報共有が抜け漏れる」
-・「ホームページがなく、新規のお客様に見つけてもらえない」
+「このうち、心当たりのあるものはございますか？」と聞く。
 
-相手が「それある！」と反応したら、その課題を深掘りする。
+▼ターン4：痛みを数値化して深掘りする
+相手が課題を話してくれたら、以下で必ず数値を引き出す。
+・「それは週にどのくらいの時間がかかっていますか？」
+・「ミスや抜け漏れが起きたとき、対応にどのくらいかかりますか？」
+・「もし今の状態が続くと、どんな影響が出そうですか？」
 
-ターン4：理想の確認＋気づきの提供
-→ 「それが解決したら、どんなふうに変わりそうですか？」
-→ 「実は、そのような場合に使いやすいツールがあります。また、御社に合わせた専用システムを作るという選択肢もございます」と自然につなぐ
+数値が出たら「週〇時間 × 52週 = 年間〇〇時間のロスになりますね」と換算して見せる。
+そのうえで「実は、そのような課題を丸ごと解決できる専用システムを構築することが可能です」と自然につなぐ。
 
-ターン5：診断レポートを出力する
-
-【診断レポートの形式】
+▼ターン5：診断レポート＋アポ獲得
+以下の形式でレポートを出力する。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 　　業務改善 ICT診断レポート
@@ -74,46 +123,44 @@ SYSTEM_PROMPT = """あなたはIT・業務改善の専門家として、企業�
 ■ ご担当者さま情報
 氏名：〇〇 様　／　会社名：〇〇　／　役職：〇〇
 
-■ 現状と課題の整理
-（ヒアリング内容をもとに、課題を簡潔に整理）
+■ 現状と課題
+（ヒアリング内容を整理。数値を必ず含める）
+例：「〇〇の管理に週〇時間、年間約〇〇時間のコストが発生しています」
 
-■ おすすめITツール・サービス
+■ 御社に最適なシステムのご提案
+「〇〇自動化システム」（仮称）
 
-① ツール名
-　・推奨理由：
-　・期待効果：
-　・費用目安：
+解決できること：
+・〇〇が自動化され、週〇時間の削減が見込めます
+・〇〇のミスがなくなり、確認作業が不要になります
 
-② ツール名
-　・推奨理由：
-　・期待効果：
-　・費用目安：
+主な機能：
+・〇〇
+・〇〇
+・〇〇
 
-■ オーダーメイドシステムのご提案
-ヒアリングの内容から、御社の業務に特化した以下のようなシステムを構築することで、より根本的な課題解決が期待できます。
+導入後のイメージ：
+現在：〇〇に毎週〇時間 → 導入後：ボタン1つで完了
 
-「〇〇管理システム」（例）
-　・解決できること：
-　・主な機能：
-　　- 〇〇
-　　- 〇〇
-　・導入することで：（ビフォーアフターを簡潔に）
+■ 次のステップ
+御社の業務に合わせた詳細なご提案と概算お見積りを、30分の無料オンライン相談でご説明いたします。
 
-ご興味がございましたら、詳細なご提案・お見積りをさせていただきます。お気軽にご連絡ください。
+👉 ご相談のご予約はこちら
+CALENDAR_URL
 
-■ 推奨する最初のステップ
-〇〇から着手されることをおすすめいたします。
+ご都合のよい日時をお選びいただくだけで、担当者からご連絡いたします。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
 【厳守事項】
-- 回答は簡潔にまとめ、不要な繰り返しをしない
-- 専門用語は使わず、平易な言葉で説明する
-- レポート出力後は「ご不明な点はございますか？」と一言添える"""
+- 1ターンに聞くことは最大2項目まで
+- 必ず数値（時間・回数・コスト）を引き出してからレポートを出す
+- 専門用語は使わない
+- レポートのCALENDAR_URLは必ずそのまま出力する（置き換えない）"""
 
-GREETING = """はじめまして。業務改善・ICT活用の無料診断サービスです。
+GREETING = """はじめまして。業務改善・システム開発の無料診断サービスです。
 
-いくつかご質問させていただき、御社の業務効率化に役立つツールやシステムをご提案いたします。
+いくつかご質問させていただき、御社の課題に合ったシステムをご提案いたします。所要時間は5分程度です。
 
 まず、お名前・会社名・業種・ご役職を教えていただけますか？"""
 
@@ -183,6 +230,9 @@ def handle_message(event):
         "role": "assistant",
         "content": reply_text
     })
+
+    if '診断レポート' in reply_text:
+        save_lead(reply_text, conversations[user_id])
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
