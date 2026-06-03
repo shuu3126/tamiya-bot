@@ -3,3 +3,14 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Google Sheets
+*.gsheet
+
+# 認証情報・シークレット
+credentials_value.txt
+*.json.key
+*.pem
+
+# テストファイル
+todo.py
